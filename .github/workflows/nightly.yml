@@ -1,0 +1,156 @@
+name: Nightly build
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "DCMMC/macPad ref (branch, tag or SHA) to build"
+        required: false
+        default: main
+      force:
+        description: "Rebuild even if the upstream SHA is unchanged"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: DCMMC/macPad
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+  FORCE: ${{ inputs.force && 'true' || 'false' }}
+  RELEASE_TAG: nightly
+  THEOS: ${{ github.workspace }}/theos
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Resolve upstream SHA and decide whether to build
+        id: check
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$UPSTREAM_REPO/commits/$UPSTREAM_REF" -q .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Upstream $UPSTREAM_REF -> $sha"
+          prev=$(gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null \
+            | sed -nE 's/.*upstream-sha: ([0-9a-f]{40}).*/\1/p' | head -1 || true)
+          echo "Previous nightly upstream SHA: ${prev:-<none>}"
+          if [ "$FORCE" != "true" ] && [ "$prev" = "$sha" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Upstream unchanged ($sha); skipping build."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out upstream
+        if: steps.check.outputs.build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.check.outputs.sha }}
+          path: macPad
+
+      - name: Install build dependencies
+        if: steps.check.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          brew install make ldid xz
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          # Use Command Line Tools so Theos doesn't pick up Xcode's newer iOS SDK.
+          sudo xcode-select -s /Library/Developer/CommandLineTools
+          xcode-select -p
+          xcrun --sdk macosx --show-sdk-path
+
+      - name: Set up Theos and SDKs
+        if: steps.check.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          git clone --recursive --depth 1 --shallow-submodules https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/sdks"
+
+          git clone --depth 1 --filter=blob:none --no-checkout https://github.com/theos/sdks.git "$RUNNER_TEMP/theos-sdks"
+          git -C "$RUNNER_TEMP/theos-sdks" sparse-checkout set --no-cone /iPhoneOS16.5.sdk/
+          git -C "$RUNNER_TEMP/theos-sdks" checkout
+          mv "$RUNNER_TEMP/theos-sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/"
+
+          MACOS_SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
+          MACOS_SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
+          ln -sfn "$MACOS_SDK_PATH" "$THEOS/sdks/MacOSX${MACOS_SDK_VER}.sdk"
+          ls -la "$THEOS/sdks"
+
+      - name: Build package
+        if: steps.check.outputs.build == 'true'
+        working-directory: macPad
+        run: |
+          set -euo pipefail
+          gmake FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 package
+
+      - name: Post-process libmachook and collect outputs
+        if: steps.check.outputs.build == 'true'
+        working-directory: macPad
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          cp .theos/obj/libmachook.dylib "$RUNNER_TEMP/out/libmachook.dylib"
+          python3 misc/set_macos_version.py "$RUNNER_TEMP/out/libmachook.dylib"
+          ldid -S "$RUNNER_TEMP/out/libmachook.dylib"
+          codesign -f -s - "$RUNNER_TEMP/out/libmachook.dylib"
+          deb=$(ls -t packages/*.deb | head -1)
+          cp "$deb" "$RUNNER_TEMP/out/"
+          cd "$RUNNER_TEMP/out"
+          shasum -a 256 *.deb libmachook.dylib > SHA256SUMS
+          cat SHA256SUMS
+          echo "DEB_NAME=$(basename "$deb")" >> "$GITHUB_ENV"
+
+      - name: Upload workflow artifact
+        if: steps.check.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macPad-nightly-${{ steps.check.outputs.sha }}
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: error
+
+      - name: Publish nightly pre-release
+        if: steps.check.outputs.build == 'true'
+        env:
+          SHA: ${{ steps.check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/notes.md"
+          cat > "$notes" <<EOF
+          **Unofficial, automated nightly build of [$UPSTREAM_REPO](https://github.com/$UPSTREAM_REPO). Not tested on-device. Use at your own risk.**
+
+          - Upstream commit: [\`$SHA\`](https://github.com/$UPSTREAM_REPO/commit/$SHA)
+          - Built: $(date -u +"%Y-%m-%d %H:%M UTC")
+          - Build log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          ### Install (Dopamine rootless)
+
+          \`\`\`sh
+          dpkg -i $DEB_NAME
+          cp libmachook.dylib /var/jb/usr/macOS/lib/libmachook.dylib
+          /var/jb/usr/macOS/bin/postinst.sh
+          \`\`\`
+
+          Verify downloads with \`shasum -a 256 -c SHA256SUMS\`.
+
+          <!-- upstream-sha: $SHA -->
+          EOF
+          gh release delete "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag -y || true
+          gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+            --prerelease --target "$GITHUB_SHA" \
+            --title "Nightly ($(date -u +%Y-%m-%d), upstream ${SHA:0:7})" \
+            --notes-file "$notes" \
+            "$RUNNER_TEMP/out/$DEB_NAME" \
+            "$RUNNER_TEMP/out/libmachook.dylib" \
+            "$RUNNER_TEMP/out/SHA256SUMS"
